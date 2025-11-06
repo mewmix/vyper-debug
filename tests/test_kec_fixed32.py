@@ -1,7 +1,7 @@
 def test_hash_equivalence(project, accounts):
     c = project.KecFixed32.deploy(sender=accounts[0])
     x = (0x11).to_bytes(32, "big")
-    assert c.h32(x) == c.h_dyn(x)
+    assert c.h32(x, sender=accounts[0]).return_value == c.h_dyn(x, sender=accounts[0]).return_value
 
 def test_gas_delta(project, accounts):
     c = project.KecFixed32.deploy(sender=accounts[0])
