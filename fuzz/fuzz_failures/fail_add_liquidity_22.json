@@ -1,0 +1,11 @@
+{
+  "name": "add_liquidity",
+  "params": {
+    "amounts": [
+      1000022,
+      1000015
+    ]
+  },
+  "info": "Transaction failed.",
+  "block": 19002977
+}
