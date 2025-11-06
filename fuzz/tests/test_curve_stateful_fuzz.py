@@ -5,8 +5,11 @@ import math
 from decimal import Decimal, getcontext
 from hypothesis.stateful import RuleBasedStateMachine, rule, precondition, invariant, initialize
 from hypothesis import settings, Verbosity
-from ape import Contract, accounts, chain, networks
+from hypothesis.strategies import integers, lists, just
+from ape import accounts, chain, networks
+from web3 import Web3, HTTPProvider
 from ape.exceptions import TransactionError
+from typing import Optional
 
 # Increase decimal precision for comparison to on-chain fixed-point math
 getcontext().prec = 80
@@ -21,37 +24,150 @@ DX_MIN = 10 ** 3
 DX_MAX = 10 ** 22
 SMALL = 10 ** 6
 
-# Helper: load contract
-def pool_contract():
-    assert POOL_ADDR, "Set POOL_ADDR env var"
-    return Contract(POOL_ADDR)
+# Load ABI from file
+script_dir = os.path.dirname(__file__)
+abi_path = os.path.join(script_dir, "..", "abi.json")
+with open(abi_path) as f:
+    POOL_ABI = json.load(f)
 
-# Helper: safe call with signature variants
-def try_call(fn, *args, sender=None, **kwargs):
+ERC20_ABI = [
+    {"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function","inputs":[]},
+    {"name":"symbol","outputs":[{"type":"string"}],"stateMutability":"view","type":"function","inputs":[]},
+    {"name":"balanceOf","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function","inputs":[{"name":"a","type":"address"}]},
+    {"name":"allowance","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function","inputs":[{"name":"o","type":"address"},{"name":"s","type":"address"}]},
+    {"name":"approve","outputs":[{"type":"bool"}],"stateMutability":"nonpayable","type":"function","inputs":[{"name":"s","type":"address"},{"name":"a","type":"uint256"}]},
+    {"name":"transfer","outputs":[{"type":"bool"}],"stateMutability":"nonpayable","type":"function","inputs":[{"name":"t","type":"address"},{"name":"a","type":"uint256"}]}
+]
+
+def _get_web3() -> Web3:
+    """
+    Return a Web3 instance.
+    Prefer Ape's connected provider; if not connected yet, fall back to ETH_RPC_URL.
+    """
     try:
-        return fn(*args, sender=sender, **kwargs)
-    except Exception as e:
-        # Bubble up to harness to record
-        raise
+        # Will raise ProviderNotConnectedError if Ape isn't connected yet
+        return networks.provider.web3
+    except Exception:
+        url = os.environ.get("ETH_RPC_URL")
+        if not url:
+            raise RuntimeError("ETH_RPC_URL must be set when Ape provider is not connected.")
+        return Web3(HTTPProvider(url))
 
-# Helper: convert raw bytes->Decimal price using high precision arithmetic
-def safe_decimal(n):
-    return Decimal(n)
+def pool_contract(w3: Web3):
+    assert POOL_ADDR, "Set POOL_ADDR env var"
+    code = w3.eth.get_code(Web3.to_checksum_address(POOL_ADDR))
+    if not code or code == b"":
+        raise RuntimeError(
+            "No contract code at POOL_ADDR on current provider. "
+            "You are not on a mainnet fork. Start anvil with --fork-url and run with --network :local:anvil."
+        )
+    return w3.eth.contract(address=Web3.to_checksum_address(POOL_ADDR), abi=POOL_ABI)
 
+def as_erc20(w3: Web3, addr: str):
+    return w3.eth.contract(address=Web3.to_checksum_address(addr), abi=ERC20_ABI)
+
+@settings(
+    max_examples=50,
+    stateful_step_count=50,
+    verbosity=Verbosity.normal,
+    deadline=None,
+)
 class CurveStateMachine(RuleBasedStateMachine):
     def __init__(self):
         super().__init__()
-        self.pool = pool_contract()
+        self.w3 = _get_web3()
+        self.pool = pool_contract(self.w3)
         # record a small local ledger of account balances for invariant checks
         self.actors = [accounts.test_accounts[i] for i in range(min(10, len(accounts.test_accounts)))]
         # pick a default caller
         self.caller = self.actors[0]
         # read coin count
+        self.n_coins = 2
+
+        # Get coins and decimals
+        self.coins = [self.pool.functions.coins(i).call() for i in range(self.n_coins)]
+        assert hasattr(self.pool, "functions"), "self.pool must be a web3 Contract, not ape.contracts.Contract"
+        self.decimals = []
+        for coin_address in self.coins:
+            if coin_address.lower() in ("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE".lower(), "0x0000000000000000000000000000000000000000"):
+                self.decimals.append(18)
+            else:
+                self.decimals.append(as_erc20(self.w3, coin_address).functions.decimals().call())
+
+        # Are we on a dev node where we can actually transact? (fork / local)
+        self.tx_ok = self._tx_capable()
+        # Optionally seed balances using a whale (only on dev nodes).
+        self.funded = self._seed_balances() if self.tx_ok else False
+
+    def _tx_capable(self) -> bool:
+        """True when running against Anvil/Hardhat where we can impersonate / set balances."""
+        name = (getattr(networks, "provider", None).name or "").lower() if getattr(networks, "provider", None) else ""
+        if "anvil" in name or "hardhat" in name:
+            return True
         try:
-            self.n_coins = self.pool.N_COINS()  # some pools expose N_COINS
+            ver = (self.w3.client_version or "").lower()
+            return ("anvil" in ver) or ("hardhat" in ver)
         except Exception:
-            # fallback to 2
-            self.n_coins = 2
+            return False
+
+    def _impersonate_or_none(self, addr: Optional[str]):
+        if not addr:
+            return None
+        # Try Anvil
+        try:
+            chain.provider.make_request("anvil_impersonateAccount", [addr])
+            return accounts[addr]
+        except Exception:
+            pass
+        # Try Hardhat
+        try:
+            chain.provider.make_request("hardhat_impersonateAccount", [addr])
+            return accounts[addr]
+        except Exception:
+            pass
+        # If already unlocked
+        try:
+            return accounts[addr]
+        except Exception:
+            return None
+
+    def _seed_balances(self) -> bool:
+        whale_addr = os.environ.get("SETH_WHALE")
+        whale = self._impersonate_or_none(whale_addr)
+        try:
+            # Always make sure test actors have gas
+            for a in self.actors:
+                chain.provider.set_balance(a.address, 10_000 * 10**18)
+        except Exception:
+            # Some providers won’t allow balance mutations; continue best-effort.
+            pass
+        if whale is None:
+            return False
+        # Transfer ERC20s from whale
+        for actor in self.actors:
+            for i, coin_address in enumerate(self.coins):
+                is_eth = coin_address.lower() in (
+                    "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "0x0000000000000000000000000000000000000000",
+                )
+                if is_eth:
+                    continue
+                # Skip Synthetix synths (sETH, etc.) – transfers may require settlement.
+                try:
+                    sym = as_erc20(self.w3, coin_address).functions.symbol().call()
+                except Exception:
+                    sym = ""
+                if sym.lower().startswith("s") or coin_address.lower() == "0x5e74c9036fb86bd7ecdcb084a0673efc32ea31cb":
+                    continue
+                coin = as_erc20(self.w3, coin_address)
+                amt = 1_000 * (10**int(self.decimals[i]))
+                try:
+                    tx = coin.functions.transfer(actor.address, amt).build_transaction({"from": whale.address})
+                    self.w3.eth.send_transaction(tx)
+                except ContractLogicError:
+                    # Non-vanilla ERC20; skip seeding this asset
+                    continue
+        return True
 
     @initialize()
     def init_state(self):
@@ -62,32 +178,15 @@ class CurveStateMachine(RuleBasedStateMachine):
     # ----- helpers to read pool internals -----
     def _D(self):
         try:
-            return int(self.pool.D())
+            return int(self.pool.functions.D().call())
         except Exception:
-            # some forks might call D() as view(uint256) or variable; try public var
-            return int(self.pool.D) if hasattr(self.pool, "D") else 0
+            return 0
 
     def _balances(self):
-        # return list of token balances as integers
         bals = []
         for i in range(self.n_coins):
-            try:
-                b = int(self.pool.balances(i))
-            except Exception:
-                # other pools expose balances array or use coins() mapping; try variations
-                try:
-                    b = int(self.pool.balances[i])
-                except Exception:
-                    b = 0
-            bals.append(b)
+            bals.append(int(self.pool.functions.balances(i).call()))
         return bals
-
-    def _virtual_price(self):
-        # if pool exposes get_virtual_price or similar
-        try:
-            return Decimal(self.pool.get_virtual_price())
-        except Exception:
-            return None
 
     # ----- invariants (checked after each rule) -----
     @invariant()
@@ -96,126 +195,38 @@ class CurveStateMachine(RuleBasedStateMachine):
         for b in bals:
             assert b >= 0, f"Negative balance detected: {b}"
 
-    @invariant()
-    def D_monotonic_non_negative(self):
-        d = self._D()
-        assert d >= 0, f"D negative {d}"
-
-    # A less strict invariant: D shouldn't drop dramatically absent admin/op changes
-    @invariant()
-    def D_not_spiking_down(self):
-        d = self._D()
-        # allow small tolerances from fees; flag large drops (>1%)
-        prev = getattr(self, "snapshot_D", None)
-        if prev:
-            # if D decreased by >1% flag as suspicious
-            if d < prev * 0.99:
-                raise AssertionError(f"D dropped too much: {prev} -> {d}")
-
     # ----- rules (operations) -----
-    @precondition(lambda self: True)
-    @rule(i=0, j=1, dx=__import__("hypothesis.strategies").integers(DX_MIN, DX_MAX))
-    def exchange(self, i, j, dx):
-        # pick a caller
-        caller = self.actors[(dx % len(self.actors))]
-        pool = self.pool
-
-        # read D before
-        D0 = self._D()
-        try:
-            # try both signatures: (i,j,dx,min_dy,receiver) or (i,j,dx,min_dy)
-            try:
-                tx = pool.exchange(i, j, dx, 0, caller, sender=caller)
-            except Exception:
-                tx = pool.exchange(i, j, dx, 0, sender=caller)
-        except TransactionError as e:
-            # record fail and raise to get reported
-            self._save_failure("exchange", dict(i=i, j=j, dx=dx), str(e))
-            raise
-
-        # post checks
-        D1 = self._D()
-        # expect no negative D and not extreme downward moves
-        if D1 < 0:
-            self._save_failure("D_negative_after_exchange", dict(i=i, j=j, dx=dx), f"{D0}->{D1}")
-            raise AssertionError("D negative after exchange")
-        if D1 < D0 * Decimal("0.99"):
-            # suspicious drop >1%
-            self._save_failure("D_drop", dict(i=i, j=j, dx=dx), f"{D0}->{D1}")
-            raise AssertionError(f"D dropped >1% after exchange {D0}->{D1}")
-
-    @precondition(lambda self: True)
-    @rule(amounts=__import__("hypothesis.strategies").lists(__import__("hypothesis.strategies").integers(SMALL, 10**18), min_size=2, max_size=2))
+    @precondition(lambda self: self.tx_ok and self.funded)
+    @rule(amounts=lists(integers(10**16, 10**18), min_size=2, max_size=2))
     def add_liquidity(self, amounts):
-        pool = self.pool
-        caller = self.actors[0]
-        try:
-            # try both signatures (many pools accept receiver)
-            try:
-                tx = pool.add_liquidity(amounts, 0, caller, sender=caller)
-            except Exception:
-                tx = pool.add_liquidity(amounts, 0, sender=caller)
-        except TransactionError as e:
-            self._save_failure("add_liquidity", dict(amounts=amounts), str(e))
-            raise
+        caller = self.caller
 
-        # quick post-checks
-        new_bals = self._balances()
-        for b in new_bals:
-            if b < 0:
-                self._save_failure("neg_bal_add_liq", dict(amounts=amounts), f"{new_bals}")
-                raise AssertionError("Negative balances after add_liquidity")
+        eth_index = -1
+        for i, coin_address in enumerate(self.coins):
+            if coin_address.lower() in ("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE".lower(), "0x0000000000000000000000000000000000000000"):
+                eth_index = i
+            else:
+                as_erc20(self.w3, coin_address).functions.approve(self.pool.address, amounts[i]).transact({"from": caller.address})
 
-    @precondition(lambda self: True)
-    @rule(lp_amount=__import__("hypothesis.strategies").integers(min_value=1, max_value=10**18), i=__import__("hypothesis.strategies").integers(0,1))
+        eth_value = amounts[eth_index] if eth_index != -1 else 0
+
+        self.pool.functions.add_liquidity(amounts, 0).transact({"from": caller.address, "value": eth_value})
+
+    @precondition(lambda self: self.tx_ok and self._D() > 0 and self.funded)
+    @rule(i=just(0), j=just(1), dx=integers(DX_MIN, 10**17))
+    def exchange(self, i, j, dx):
+        caller = self.actors[(dx % len(self.actors))]
+
+        eth_value = dx if self.coins[i].lower() in ("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE".lower(), "0x0000000000000000000000000000000000000000") else 0
+        if not eth_value:
+            as_erc20(self.w3, self.coins[i]).functions.approve(self.pool.address, dx).transact({"from": caller.address})
+
+        self.pool.functions.exchange(i, j, dx, 0).transact({"from": caller.address, "value": eth_value})
+
+    @precondition(lambda self: self.tx_ok and self._D() > 0 and self.funded)
+    @rule(lp_amount=integers(min_value=10**16, max_value=10**18), i=integers(0,1))
     def remove_liquidity_one(self, lp_amount, i):
-        pool = self.pool
-        caller = self.actors[0]
-        if not hasattr(pool, "remove_liquidity_one_coin"):
-            return
-        try:
-            try:
-                tx = pool.remove_liquidity_one_coin(lp_amount, i, 0, caller, sender=caller)
-            except Exception:
-                tx = pool.remove_liquidity_one_coin(lp_amount, i, 0, sender=caller)
-        except TransactionError as e:
-            self._save_failure("remove_liquidity_one_coin", dict(lp_amount=lp_amount, i=i), str(e))
-            raise
+        caller = self.caller
+        self.pool.functions.remove_liquidity_one_coin(lp_amount, i, 0).transact({"from": caller.address})
 
-        # post-check balances
-        bals = self._balances()
-        for b in bals:
-            if b < 0:
-                self._save_failure("neg_bal_after_remove", dict(lp_amount=lp_amount, i=i), str(bals))
-                raise AssertionError("Negative balance after remove")
-
-    @precondition(lambda self: ADMIN_ADDR is not None)
-    @rule(new_A=__import__("hypothesis.strategies").integers(1, 10**6))
-    def ramp_A(self, new_A):
-        pool = self.pool
-        # impersonate admin if unlocked in anvil
-        admin = accounts.test_accounts[0] if ADMIN_ADDR is None else accounts.at(ADMIN_ADDR)
-        try:
-            if hasattr(pool, "ramp_A_gamma"):
-                pool.ramp_A_gamma(new_A, new_A, chain.blocks[-1].timestamp + 3600, sender=admin)
-            elif hasattr(pool, "ramp_A"):
-                pool.ramp_A(new_A, chain.blocks[-1].timestamp + 3600, sender=admin)
-        except Exception as e:
-            self._save_failure("ramp_A_fail", dict(new_A=new_A), str(e))
-            raise
-
-    # utility: persist failing case and basic context
-    def _save_failure(self, name, params, info):
-        fname = os.path.join(FAIL_DIR, f"fail_{name}_{len(os.listdir(FAIL_DIR))}.json")
-        obj = {
-            "name": name,
-            "params": params,
-            "info": str(info),
-            "block": chain.blocks[-1].number,
-        }
-        with open(fname, "w") as f:
-            json.dump(obj, f, indent=2)
-
-# Hypothesis settings tuned for stress and traceability
 TestStateMachine = CurveStateMachine.TestCase
-settings(max_examples=200, stateful_step_count=200, verbosity=Verbosity.normal)

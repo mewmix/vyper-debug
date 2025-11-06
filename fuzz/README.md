@@ -1,36 +1,41 @@
-# Curve TwoCrypto-NG Local State Fuzzer (Hypothesis + Ape)
+# Curve Pool Fuzzing Suite
 
-Prereqs:
-- anvil installed (foundry's anvil)
-- Python 3.11+ and virtualenv
-- ETH_RPC_URL pointing at an Ethereum provider (Alchemy/Infura)
-- POOL_ADDR set to the pool address to fuzz
-- (optional) ADMIN_ADDR to impersonate admin operations
+This directory contains a stateful fuzzing suite for Curve pools, using Hypothesis and `eth-ape`.
 
-Install:
-```
+## Running the Fuzzer
 
-python -m venv .venv && source .venv/bin/activate
-pip install -r fuzz/requirements.txt
+There are two ways to run the fuzzer:
 
-```
+**1. Live RPC (Read-Only Invariants)**
 
-Start a fork (in separate terminal):
-```
+This mode runs only the read-only invariants against a live mainnet RPC. It's useful for quickly checking for basic inconsistencies without needing to set up a forked environment.
 
-export ETH_RPC_URL="[https://eth-mainnet.alchemyapi.io/v2/KEY](https://eth-mainnet.alchemyapi.io/v2/KEY)"
-export POOL_ADDR="0x..."
-export ADMIN_ADDR="0x..."    # optional, to allow admin ops
-bash fuzz/run_anvil.sh
-
-```
-
-Run the stateful fuzz:
-```
-
+```bash
+. .venv/bin/activate
+export ETH_RPC_URL="<YOUR_ALCHEMY_MAINNET_RPC_URL>"
+export POOL_ADDR="0xc5424b857f758e906013f3555dad202e4bdb4567"
+unset ADMIN_ADDR SETH_WHALE
 cd fuzz
-pytest -q tests/test_curve_stateful_fuzz.py::TestCase  -k TestCase -s
-
+pytest -q tests/test_curve_stateful_fuzz.py -s
 ```
 
-Failures are saved to `fuzz_failures/` as JSON. Use `scripts/minimize_failure.py` for manual triage.
+**2. Dev Fork (Full Stateful Fuzz)**
+
+This mode runs the full stateful fuzzing suite against a forked Anvil instance. This allows for testing of state-changing operations like `add_liquidity`, `exchange`, and `remove_liquidity_one`.
+
+First, start the forked Anvil instance:
+
+```bash
+# In one shell
+./run_anvil.sh
+```
+
+Then, in another shell, run the fuzzer:
+
+```bash
+# In another shell
+. .venv/bin/activate
+export POOL_ADDR="0xc5424b857f758e906013f3555dad202e4bdb4567"
+export SETH_WHALE="0x06920C9fC643De77B99cB7670A944AD31eaAA260" # A whale with stETH and ETH
+ape test --network :local:foundry -q fuzz/tests/test_curve_stateful_fuzz.py -s
+```

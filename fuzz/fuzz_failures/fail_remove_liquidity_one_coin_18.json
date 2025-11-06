@@ -1,0 +1,9 @@
+{
+  "name": "remove_liquidity_one_coin",
+  "params": {
+    "lp_amount": 39031,
+    "i": 1
+  },
+  "info": "Transaction failed.",
+  "block": 19002740
+}

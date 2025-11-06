@@ -1,6 +1,5 @@
 eth-ape>=0.7.0
 ape-vyper
-ape-anvil
 hypothesis
 pytest
 python-dotenv
