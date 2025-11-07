@@ -10,6 +10,8 @@ from ape import accounts, chain, networks
 from web3 import Web3, HTTPProvider
 from ape.exceptions import TransactionError
 from typing import Optional
+from eth_abi import encode as abi_encode
+from web3.exceptions import ContractLogicError
 
 # Increase decimal precision for comparison to on-chain fixed-point math
 getcontext().prec = 80
@@ -188,6 +190,71 @@ class CurveStateMachine(RuleBasedStateMachine):
             bals.append(int(self.pool.functions.balances(i).call()))
         return bals
 
+    # ---- helpers: ABI-robust pool calls ----
+    def _pool_has_fn(self, name: str, arg_types: list[str]) -> bool:
+        """Check if ABI has a function by name + exact arg types."""
+        try:
+            fns = [f for f in self.pool.functions if f.fn_name == name]
+        except Exception:
+            fns = []
+        for f in fns:
+            try:
+                sig = f._function.signature
+                # crude check: compare "name(type1,type2,...)"
+                if sig == f"{name}({','.join(arg_types)})":
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _call_add_liquidity(self, amounts, caller_addr, eth_value: int):
+        """
+        Try common Curve add_liquidity signatures, provide explicit gas to bypass estimate.
+        Order:
+          1) (uint256[2], uint256)
+          2) (uint256[2], uint256, address)  # receiver
+          3) (uint256[2], uint256, bool)     # use_eth
+        """
+        tx_args = {"from": caller_addr, "value": eth_value, "gas": 2_000_000}
+
+        # v1: (amounts, min_mint)
+        if self._pool_has_fn("add_liquidity", ["uint256[2]","uint256"]):
+            try:
+                return self.pool.functions.add_liquidity(amounts, 0).transact(tx_args)
+            except ContractLogicError as e:
+                # fallthrough to try other variants
+                pass
+
+        # v2: (amounts, min_mint, receiver)
+        if self._pool_has_fn("add_liquidity", ["uint256[2]","uint256","address"]):
+            try:
+                return self.pool.functions.add_liquidity(amounts, 0, caller_addr).transact(tx_args)
+            except ContractLogicError:
+                pass
+
+        # v3: (amounts, min_mint, use_eth)
+        # Important: only set use_eth=True if one coin is native-ETH sentinel in coins[].
+        use_eth = eth_value > 0
+        if self._pool_has_fn("add_liquidity", ["uint256[2]","uint256","bool"]):
+            try:
+                return self.pool.functions.add_liquidity(amounts, 0, use_eth).transact(tx_args)
+            except ContractLogicError:
+                pass
+
+        # If ABI didn’t expose signature metadata, brute-try safely in decreasing likelihood
+        # (all within explicit gas; errors stay local to hypothesis run)
+        for variant in ("2", "3-addr", "3-bool"):
+            try:
+                if variant == "2":
+                    return self.pool.functions.add_liquidity(amounts, 0).transact(tx_args)
+                if variant == "3-addr":
+                    return self.pool.functions.add_liquidity(amounts, 0, caller_addr).transact(tx_args)
+                if variant == "3-bool":
+                    return self.pool.functions.add_liquidity(amounts, 0, use_eth).transact(tx_args)
+            except Exception:
+                continue
+        raise ContractLogicError("add_liquidity: all known signatures reverted (ABI mismatch or balance/allowance).")
+
     # ----- invariants (checked after each rule) -----
     @invariant()
     def no_negative_balances(self):
@@ -209,8 +276,8 @@ class CurveStateMachine(RuleBasedStateMachine):
                 as_erc20(self.w3, coin_address).functions.approve(self.pool.address, amounts[i]).transact({"from": caller.address})
 
         eth_value = amounts[eth_index] if eth_index != -1 else 0
-
-        self.pool.functions.add_liquidity(amounts, 0).transact({"from": caller.address, "value": eth_value})
+        # Bypass estimateGas by setting 'gas' and try all Curve variants
+        self._call_add_liquidity(amounts, caller.address, eth_value)
 
     @precondition(lambda self: self.tx_ok and self._D() > 0 and self.funded)
     @rule(i=just(0), j=just(1), dx=integers(DX_MIN, 10**17))
